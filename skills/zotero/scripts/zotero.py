@@ -7,8 +7,17 @@
 # @Email  : sepinetam@gmail.com
 # @File   : zotero-search/scripts/zotero.py
 
+"""Zotero 本地数据库与本地 HTTP API 的只读客户端。
+
+Zotero 直接读取 zotero.sqlite，Zotero 无需运行；
+ZoteroAPI 访问 Zotero Desktop 的本地 HTTP 服务，需要 Zotero 运行并开启本地 API。
+"""
+
+from __future__ import annotations  # 避免 3.9 及以下的爆炸🤯，我的 Mac 默认的 python 就是 3.9
+
+import argparse
+import inspect
 import os
-import sys
 import platform
 import sqlite3
 import re
@@ -88,7 +97,13 @@ class Item:
 
         def add(name: str, value: str | int | None) -> None:
             if value:
-                escaped = str(value).replace("&", r"\&").replace("%", r"\%")
+                escaped = (
+                    str(value)
+                    .replace("&", r"\&")
+                    .replace("%", r"\%")
+                    .replace("#", r"\#")
+                    .replace("_", r"\_")
+                )
                 fields.append((name, escaped))
 
         if authors:
@@ -137,6 +152,10 @@ class Attachment:
         return self.url or None
 
 
+# TODO: 补全本地 API 的 search / cite / get_details / get_notes /
+# get_attachments / get_fulltext 方法。
+# 原因：Zotero 运行时会对 zotero.sqlite 持有独占锁，外部只读连接会报
+# "database is locked"；此时应改走本地 API，DB 客户端只用于 Zotero 关闭时。
 class ZoteroAPI:
     DEFAULT_API_BASE = "http://127.0.0.1:23119"
     API_HEADERS = {"Zotero-API-Version": "3"}
@@ -214,30 +233,197 @@ class Zotero:
         db_path: Path | None = None,
         conn_mode: ConnectMode = ConnectMode.read_only
     ):
-        self.db_path: Path = db_path or self._get_zotero_db_path()
+        self.db_path: Path = Path(db_path).expanduser() if db_path else self._get_zotero_db_path()
 
-        if self.db_path is None:
-            raise ValueError("Zotero Database Path not Found")
         if not self.db_path.is_file():
             raise ValueError("Please check whether your Zotero database path is correct")
 
         self.conn_mode = conn_mode
 
     def get_detail(self, item: Item) -> dict:
+        """Serialize an item to a plain dictionary.
+
+        Args:
+            item: The item to serialize.
+
+        Returns:
+            A dict containing every field of the item.
+        """
         return item.to_dict()
 
     def search(
-        self, 
-        keywords: list[str],
-        # 后续会有更多的参数可以加
+        self,
+        keywords: list[str] | str,
+        *,
+        year_from: int | None = None,
+        year_to: int | None = None,
+        limit: int = 25,
+        offset: int = 0,
+        in_publication: str | None = None,  # 来指定某本期刊或书
+        with_tag: bool = True,  # tag，等价于常规理解的关键词
+        with_notes: bool = True,
     ) -> list[Item]:
-        pass
+        """Search Zotero items by keywords.
+
+        Each keyword must match at least one of: metadata fields (title, short
+        title, abstract, publication), a creator name, or—when enabled—tags
+        and notes. Multiple keywords are combined with AND.
+
+        Args:
+            keywords: A keyword or a list of keywords to search for.
+            year_from: Inclusive lower bound for the publication year.
+            year_to: Inclusive upper bound for the publication year.
+            limit: Maximum number of items to return.
+            offset: Number of matched items to skip.
+            in_publication: Restrict to a journal, proceedings or book name.
+            with_tag: Also match keywords against tags.
+            with_notes: Also match keywords against note content.
+
+        Returns:
+            Matching items sorted by modification time, newest first.
+            Items without a parseable year are skipped when a year bound is set.
+        """
+        if limit < 0 or offset < 0:
+            raise ValueError("limit and offset must be non-negative")
+
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        terms = [term.strip() for term in keywords if term and term.strip()]
+
+        def like(term: str) -> str:
+            escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            return f"%{escaped}%"
+
+        conditions = [
+            "del.itemID IS NULL",
+            "it.typeName NOT IN ('attachment', 'note', 'annotation')",
+        ]
+        params: list[str] = []
+
+        # 限定出版物：期刊/会议用对应字段，图书的题名存在 title 里
+        if in_publication:
+            conditions.append(
+                """EXISTS (
+                    SELECT 1
+                    FROM itemData d
+                    JOIN fieldsCombined f ON f.fieldID = d.fieldID
+                    JOIN itemDataValues v ON v.valueID = d.valueID
+                    WHERE d.itemID = i.itemID
+                      AND (
+                          f.fieldName IN ('publicationTitle', 'bookTitle', 'proceedingsTitle')
+                          OR (f.fieldName = 'title' AND it.typeName = 'book')
+                      )
+                      AND v.value LIKE ? ESCAPE '\\'
+                )"""
+            )
+            params.append(like(in_publication))
+
+        # 每个关键词都必须命中：元数据、作者，以及可选的 tag、笔记
+        for term in terms:
+            pattern = like(term)
+            branches = [
+                """EXISTS (
+                    SELECT 1
+                    FROM itemData d
+                    JOIN fieldsCombined f ON f.fieldID = d.fieldID
+                    JOIN itemDataValues v ON v.valueID = d.valueID
+                    WHERE d.itemID = i.itemID
+                      AND f.fieldName IN (
+                          'title', 'shortTitle', 'abstractNote',
+                          'publicationTitle', 'bookTitle', 'proceedingsTitle',
+                          'publisher', 'university'
+                      )
+                      AND v.value LIKE ? ESCAPE '\\'
+                )""",
+                """EXISTS (
+                    SELECT 1
+                    FROM itemCreators ic
+                    JOIN creators c ON c.creatorID = ic.creatorID
+                    WHERE ic.itemID = i.itemID
+                      AND (c.firstName || ' ' || c.lastName) LIKE ? ESCAPE '\\'
+                )""",
+            ]
+            term_params = [pattern, pattern]
+
+            if with_tag:
+                branches.append(
+                    """EXISTS (
+                        SELECT 1
+                        FROM itemTags it2
+                        JOIN tags t ON t.tagID = it2.tagID
+                        WHERE it2.itemID = i.itemID AND t.name LIKE ? ESCAPE '\\'
+                    )"""
+                )
+                term_params.append(pattern)
+
+            if with_notes:
+                branches.append(
+                    """EXISTS (
+                        SELECT 1
+                        FROM itemNotes n
+                        WHERE n.parentItemID = i.itemID
+                          AND n.note LIKE ? ESCAPE '\\'
+                          AND n.itemID NOT IN (SELECT itemID FROM deletedItems)
+                    )"""
+                )
+                term_params.append(pattern)
+
+            conditions.append("(" + "\n                OR ".join(branches) + ")")
+            params.extend(term_params)
+
+        sql = f"""
+            SELECT i.key,
+                   (
+                       SELECT v.value
+                       FROM itemData d
+                       JOIN fieldsCombined f ON f.fieldID = d.fieldID
+                       JOIN itemDataValues v ON v.valueID = d.valueID
+                       WHERE d.itemID = i.itemID AND f.fieldName = 'date'
+                       LIMIT 1
+                   ) AS date
+            FROM items i
+            JOIN itemTypes it ON it.itemTypeID = i.itemTypeID
+            LEFT JOIN deletedItems del ON del.itemID = i.itemID
+            WHERE {' AND '.join(conditions)}
+            ORDER BY i.dateModified DESC
+        """
+        rows = self.connect().execute(sql, params).fetchall()
+
+        # date 是自由文本，年份在 Python 侧解析更可靠
+        if year_from is not None or year_to is not None:
+            def in_year_range(date_text: str | None) -> bool:
+                match = re.search(r"\b(\d{4})\b", date_text or "")
+                if match is None:
+                    return False
+                year = int(match.group(1))
+                if year_from is not None and year < year_from:
+                    return False
+                if year_to is not None and year > year_to:
+                    return False
+                return True
+
+            rows = [row for row in rows if in_year_range(row[1])]
+
+        return [self.get_item(key) for (key, _) in rows[offset:offset + limit]]
 
     def cite(
         self,
         key: str,
         format: CitationFormat | str = CitationFormat.bibtex
     ) -> str:
+        """Render a citation for an item.
+
+        Args:
+            key: The Zotero item key.
+            format: Output format, either a CitationFormat or its string value.
+
+        Returns:
+            A single BibTeX entry.
+
+        Raises:
+            KeyError: If no item matches the key.
+            ValueError: If the format is not supported.
+        """
         if not isinstance(format, CitationFormat):
             try:
                 format = CitationFormat(format)
@@ -389,6 +575,17 @@ class Zotero:
         )
 
     def get_notes(self, key: str) -> list[str]:
+        """Return the note contents of an item.
+
+        Notes are stored as HTML and returned verbatim. Deleted notes and
+        notes whose parent item is deleted are skipped.
+
+        Args:
+            key: The Zotero item key.
+
+        Returns:
+            Note HTML strings in insertion order.
+        """
         # 取该条目的笔记正文（HTML），跳过已删除的笔记和已删除的父条目
         conn = self.connect()
         return [
@@ -408,6 +605,20 @@ class Zotero:
         ]
 
     def get_attachments(self, key: str) -> list[Attachment]:
+        """Return the attachments of an item.
+
+        Imported files have their ``storage:`` prefix expanded to an absolute
+        path under ``<data dir>/storage/<attachment key>/``. Linked files keep
+        their on-disk path. Linked URLs are returned in ``url`` with ``path``
+        set to None. Deleted attachments and attachments of deleted items are
+        skipped.
+
+        Args:
+            key: The parent item key.
+
+        Returns:
+            Attachment objects in insertion order.
+        """
         # 取该条目的附件列表；storage: 前缀展开为数据目录下的真实路径
         conn = self.connect()
         rows = conn.execute(
@@ -471,6 +682,18 @@ class Zotero:
         return attachments
 
     def get_fulltext(self, key: str) -> str | None:
+        """Return the locator of an item's full text.
+
+        Prefers the path of a local PDF attachment; otherwise returns the
+        first attachment path or URL. This returns where the text lives, not
+        the extracted text itself.
+
+        Args:
+            key: The parent item key.
+
+        Returns:
+            A filesystem path or URL, or None when no attachment is usable.
+        """
         # 返回全文的实际位置：优先 PDF 文件路径，其次任意附件的路径或网址
         attachments = self.get_attachments(key)
         for attachment in attachments:
@@ -493,9 +716,9 @@ class Zotero:
         return self._get_default_db_path()
 
     def _get_default_db_path(self) -> Path:
-        if platform.system == "Darwin":
+        if platform.system() == "Darwin":
             return Path.home() / "Zotero" / "zotero.sqlite"
-        elif platform.system == "Windows":
+        elif platform.system() == "Windows":
             return Path(os.environ.get("USERPROFILE") or Path.home()) / "Zotero" / "zotero.sqlite"
         else:
             raise SystemError("Unknown or unsupported system")
@@ -503,9 +726,10 @@ class Zotero:
     def connect(self):
         if getattr(self, "_conn", None) is None:
             self._conn = sqlite3.connect(
-                f"file:{self.db_path}?mode={self.conn_mode}", 
+                f"file:{self.db_path}?mode={self.conn_mode.value}",
                 uri=True
             )
+            self._conn.execute("PRAGMA busy_timeout = 5000")
         return self._conn
 
     def disconnect(self):
@@ -525,8 +749,182 @@ class Zotero:
         self.disconnect()
 
 
-def main():
-    ...
+def _attachment_to_dict(attachment: Attachment) -> dict:
+    """Convert an attachment to a JSON-serialisable dict."""
+    return {
+        "key": attachment.key,
+        "path": str(attachment.path) if attachment.path is not None else None,
+        "filename": attachment.filename,
+        "content_type": attachment.content_type,
+        "link_mode": attachment.link_mode,
+        "url": attachment.url,
+        "has_full_text": attachment.has_full_text,
+    }
+
+
+def _print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    with Zotero() as zotero:
+        items = zotero.search(
+            args.keywords,
+            year_from=args.year_from,
+            year_to=args.year_to,
+            limit=args.limit,
+            offset=args.offset,
+            in_publication=args.in_publication,
+            with_tag=args.with_tag,
+            with_notes=args.with_notes,
+        )
+    _print_json([item.to_dict() for item in items])
+
+
+def cmd_cite(args: argparse.Namespace) -> None:
+    with Zotero() as zotero:
+        print(zotero.cite(args.key, args.format))
+
+
+def cmd_get_details(args: argparse.Namespace) -> None:
+    with Zotero() as zotero:
+        item = zotero.get_item(args.key)
+        details = zotero.get_detail(item)
+    _print_json(details)
+
+
+def cmd_get_notes(args: argparse.Namespace) -> None:
+    with Zotero() as zotero:
+        notes = zotero.get_notes(args.key)
+    _print_json(notes)
+
+
+def cmd_get_attachments(args: argparse.Namespace) -> None:
+    with Zotero() as zotero:
+        attachments = zotero.get_attachments(args.key)
+    _print_json([_attachment_to_dict(attachment) for attachment in attachments])
+
+
+def cmd_get_fulltext(args: argparse.Namespace) -> None:
+    with Zotero() as zotero:
+        locator = zotero.get_fulltext(args.key)
+    _print_json(locator)
+
+
+def handle_help(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Show help for a command.
+
+    Without --docstring this behaves exactly like `<command> --help`. With
+    --docstring it prints the docstring of the Zotero method behind the
+    command.
+    """
+    if args.topic is None:
+        parser.print_help()
+        return
+
+    if args.topic not in DOCSTRING_TARGETS:
+        parser.error(f"unknown command: {args.topic}")
+
+    if args.docstring:
+        target = DOCSTRING_TARGETS[args.topic]
+        print(inspect.getdoc(target) or f"No docstring for {args.topic}")
+        return
+
+    parser.parse_args([args.topic, "--help"])
+
+
+DOCSTRING_TARGETS = {
+    "search": Zotero.search,
+    "cite": Zotero.cite,
+    "get_details": Zotero.get_detail,
+    "get_notes": Zotero.get_notes,
+    "get_attachments": Zotero.get_attachments,
+    "get_fulltext": Zotero.get_fulltext,
+    "help": handle_help,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="zotero.py",
+        description="Query a local Zotero library without the GUI.",
+    )
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    search = subcommands.add_parser("search", help="Search items by keywords")
+    search.add_argument("keywords", nargs="+", help="Keywords, combined with AND")
+    search.add_argument(
+        "--year-from", type=int, dest="year_from",
+        help="Inclusive lower bound for the publication year",
+    )
+    search.add_argument(
+        "--year-to", type=int, dest="year_to",
+        help="Inclusive upper bound for the publication year",
+    )
+    search.add_argument("--limit", type=int, default=25)
+    search.add_argument("--offset", type=int, default=0)
+    search.add_argument(
+        "--in-publication", dest="in_publication",
+        help="Restrict to a journal, proceedings or book name",
+    )
+    search.add_argument(
+        "--no-tag", action="store_false", dest="with_tag",
+        help="Do not match keywords against tags",
+    )
+    search.add_argument(
+        "--no-notes", action="store_false", dest="with_notes",
+        help="Do not match keywords against notes",
+    )
+    search.set_defaults(handler=cmd_search)
+
+    cite = subcommands.add_parser("cite", help="Render a citation for an item")
+    cite.add_argument("key")
+    cite.add_argument("--format", default="bibtex")
+    cite.set_defaults(handler=cmd_cite)
+
+    details = subcommands.add_parser("get_details", help="Show all fields of an item")
+    details.add_argument("key")
+    details.set_defaults(handler=cmd_get_details)
+
+    notes = subcommands.add_parser("get_notes", help="Show the notes of an item")
+    notes.add_argument("key")
+    notes.set_defaults(handler=cmd_get_notes)
+
+    attachments = subcommands.add_parser(
+        "get_attachments", help="List the attachments of an item"
+    )
+    attachments.add_argument("key")
+    attachments.set_defaults(handler=cmd_get_attachments)
+
+    fulltext = subcommands.add_parser(
+        "get_fulltext", help="Locate the full text of an item"
+    )
+    fulltext.add_argument("key")
+    fulltext.set_defaults(handler=cmd_get_fulltext)
+
+    help_command = subcommands.add_parser("help", help="Show help for a command")
+    help_command.add_argument(
+        "topic", nargs="?", metavar="command", help="Command to describe"
+    )
+    help_command.add_argument(
+        "--docstring",
+        action="store_true",
+        help="Print the docstring of the Zotero method instead of CLI help",
+    )
+    help_command.set_defaults(handler=None)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "help":
+        handle_help(parser, args)
+        return
+
+    args.handler(args)
 
 
 if __name__ == "__main__":
