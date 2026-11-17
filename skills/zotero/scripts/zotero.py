@@ -721,7 +721,7 @@ class Zotero:
         elif platform.system() == "Windows":
             return Path(os.environ.get("USERPROFILE") or Path.home()) / "Zotero" / "zotero.sqlite"
         else:
-            raise SystemError("Unknown or unsupported system")
+            return Path.home() / "Zotero" / "zotero.sqlite"
 
     def connect(self):
         if getattr(self, "_conn", None) is None:
