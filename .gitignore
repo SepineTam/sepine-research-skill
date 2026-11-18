@@ -1,0 +1,60 @@
+# OS X
+*.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+
+# my data
+*.jsonl
+*.csv
+*.dta
+
+# uv ruff
+.ruff_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+MANIFEST
+__pypackages__/
+
+# Testing / coverage
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Virtual environments
+.env
+.venv/
+venv/
+env/
+
+# Logs
+*.log
