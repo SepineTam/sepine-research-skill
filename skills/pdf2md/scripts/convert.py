@@ -345,13 +345,98 @@ class PaddleOCR(ConvertBase):
         return output_dir
 
 
-BACKENDS = {"mineru": MinerU, "paddleocr": PaddleOCR, "somark": SoMark}
+class PyMuPDF(ConvertBase):
+    def convert(
+        self,
+        source: str | Path,
+        output_path: Path | None = None,
+    ) -> Path:
+        try:
+            import pymupdf4llm
+        except ImportError as exc:
+            raise RuntimeError(
+                "pymupdf4llm is required: uv run --with pymupdf4llm "
+                "python3 convert.py ... --backend pymupdf"
+            ) from exc
+
+        source = Path(source).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"PDF not found: {source}")
+
+        content = source.read_bytes()
+        output_dir = Path(output_path) if output_path else self._generate_output_path(content)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        markdown = pymupdf4llm.to_markdown(str(source))
+        (output_dir / "document.md").write_text(markdown, encoding="utf-8")
+        self._write_json(
+            output_dir / "metadata.json",
+            {
+                "backend": "pymupdf",
+                "source": str(source),
+            },
+        )
+        return output_dir
+
+
+class Marker(ConvertBase):
+    def convert(
+        self,
+        source: str | Path,
+        output_path: Path | None = None,
+    ) -> Path:
+        try:
+            from marker.converters.pdf import PdfConverter
+            from marker.models import create_model_dict
+            from marker.output import text_from_rendered
+        except ImportError as exc:
+            raise RuntimeError(
+                "marker-pdf is required: uv run --with marker-pdf "
+                "python3 convert.py ... --backend marker"
+            ) from exc
+
+        source = Path(source).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"PDF not found: {source}")
+
+        content = source.read_bytes()
+        output_dir = Path(output_path) if output_path else self._generate_output_path(content)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        converter = PdfConverter(artifact_dict=create_model_dict())
+        rendered = converter(str(source))
+        text, _extension, images = text_from_rendered(rendered)
+
+        (output_dir / "document.md").write_text(text, encoding="utf-8")
+        for filename, image in images.items():
+            image_path = output_dir / filename
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(image_path)
+
+        self._write_json(
+            output_dir / "metadata.json",
+            {
+                "backend": "marker",
+                "source": str(source),
+                "images": len(images),
+            },
+        )
+        return output_dir
+
+
+BACKENDS = {
+    "marker": Marker,
+    "mineru": MinerU,
+    "paddleocr": PaddleOCR,
+    "pymupdf": PyMuPDF,
+    "somark": SoMark,
+}
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="convert.py",
-        description="Convert a PDF to Markdown with MinerU, SoMark or PaddleOCR.",
+        description="Convert a PDF to Markdown using the selected backend.",
     )
     parser.add_argument("file", type=Path, help="Path to the PDF file")
     parser.add_argument(
