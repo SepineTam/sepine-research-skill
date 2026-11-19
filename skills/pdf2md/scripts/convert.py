@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import mimetypes
@@ -266,13 +267,91 @@ class SoMark(ConvertBase):
         return output_dir
 
 
-BACKENDS = {"mineru": MinerU, "somark": SoMark}
+class PaddleOCR(ConvertBase):
+    API_URL_ENV = "PADDLEOCR_API_URL"
+    TOKEN_ENV = "PADDLEOCR_ACCESS_TOKEN"
+
+    def convert(
+        self,
+        source: str | Path,
+        output_path: Path | None = None,
+    ) -> Path:
+        source = Path(source).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"PDF not found: {source}")
+
+        api_url = os.getenv(self.API_URL_ENV)
+        token = os.getenv(self.TOKEN_ENV)
+        if not api_url or not token:
+            raise RuntimeError(
+                f"{self.API_URL_ENV} and {self.TOKEN_ENV} environment variables must be set"
+            )
+
+        content = source.read_bytes()
+        output_dir = Path(output_path) if output_path else self._generate_output_path(content)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "file": base64.b64encode(content).decode("ascii"),
+            "fileType": 0,  # 0 = PDF, 1 = image
+            "useDocOrientationClassify": False,
+            "useDocUnwarping": False,
+            "useChartRecognition": False,
+        }
+        raw = self._request(
+            api_url,
+            method="POST",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"token {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=float(os.getenv("PDF2MD_TIMEOUT", DEFAULT_TIMEOUT)),
+        )
+        response = json.loads(raw.decode("utf-8"))
+        if response.get("errorCode", 0) != 0:
+            raise RuntimeError(
+                f"PaddleOCR error {response.get('errorCode')}: {response.get('errorMsg')}"
+            )
+
+        result = response.get("result") or {}
+        pages = result.get("layoutParsingResults") or []
+
+        markdown_parts = []
+        for page in pages:
+            text = (page.get("markdown") or {}).get("text")
+            if not text:
+                blocks = page.get("parsing_res_list") or []
+                blocks = sorted(blocks, key=lambda block: block.get("block_order", 0))
+                text = "\n\n".join(
+                    block.get("block_content", "")
+                    for block in blocks
+                    if block.get("block_content")
+                )
+            if text:
+                markdown_parts.append(text)
+        markdown = "\n\n".join(markdown_parts)
+
+        (output_dir / "document.md").write_text(markdown, encoding="utf-8")
+        self._write_json(output_dir / "document.json", result)
+        self._write_json(
+            output_dir / "metadata.json",
+            {
+                "backend": "paddleocr",
+                "source": str(source),
+                "pages": len(pages),
+            },
+        )
+        return output_dir
+
+
+BACKENDS = {"mineru": MinerU, "paddleocr": PaddleOCR, "somark": SoMark}
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="convert.py",
-        description="Convert a PDF to Markdown with MinerU or SoMark.",
+        description="Convert a PDF to Markdown with MinerU, SoMark or PaddleOCR.",
     )
     parser.add_argument("file", type=Path, help="Path to the PDF file")
     parser.add_argument(
