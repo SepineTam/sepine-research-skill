@@ -18,7 +18,6 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -100,17 +99,17 @@ class ConvertBase(ABC):
                 (
                     f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
                     f"{value}\r\n"
-                ).encode("utf-8")
+                ).encode()
             )
         parts.append(
             (
                 f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
                 f'filename="{safe_name}"\r\nContent-Type: {content_type}\r\n\r\n'
-            ).encode("utf-8")
+            ).encode()
         )
         parts.append(content)
         parts.append(b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        parts.append(f"--{boundary}--\r\n".encode())
         return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
     @staticmethod
@@ -155,7 +154,7 @@ class MinerU(ConvertBase):
         if not task_id or not file_url:
             raise RuntimeError(f"MinerU returned no upload task: {created}")
 
-        self._request(file_url, method="PUT", data=content)
+        self._request(file_url, method="PUT", data=content, headers={"Content-Type": ""})
 
         result = self._wait(base, task_id)
         markdown_url = result.get("markdown_url")
@@ -267,8 +266,44 @@ class SoMark(ConvertBase):
         return output_dir
 
 
-def main():
-    ...
+BACKENDS = {"mineru": MinerU, "somark": SoMark}
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="convert.py",
+        description="Convert a PDF to Markdown with MinerU or SoMark.",
+    )
+    parser.add_argument("file", type=Path, help="Path to the PDF file")
+    parser.add_argument(
+        "--output_base",
+        type=Path,
+        default=ConvertBase.OUTPUT_BASE,
+        help="Base directory for conversion output",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=sorted(BACKENDS),
+        default="mineru",
+        help="Parsing backend (default: mineru)",
+    )
+    parser.add_argument(
+        "--env",
+        nargs="+",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra environment variables, e.g. SOMARK_API_KEY=sk-xxx",
+    )
+    args = parser.parse_args(argv)
+
+    for item in args.env:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"invalid --env value: {item!r}")
+        os.environ[key] = value
+
+    converter = BACKENDS[args.backend](output_base=args.output_base)
+    print(converter.convert(args.file))
 
 
 if __name__ == "__main__":
